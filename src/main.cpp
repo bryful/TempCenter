@@ -10,8 +10,8 @@
 struct TmpHumInfo
 {
   int status; // 0: 未接続, 1: 正常
-  String tmp; // AHT21の温度
-  String hum; // AHT21の湿度 (※BMP280は湿度非対応のためAHT21から取得)
+  float tmp;  // AHT21の温度
+  float hum;  // AHT21の湿度 (※BMP280は湿度非対応のためAHT21から取得)
 };
 
 // --- ピン配置設定 ---
@@ -214,15 +214,15 @@ void loop()
 
                 // 小数点第1位に丸めて構造体と送信用文字列に格納
                 sensorData[i].status = 1;
-                sensorData[i].tmp = String(temp.temperature, 1);
-                sensorData[i].hum = String(humidity.relative_humidity, 1);
+                sensorData[i].tmp = temp.temperature;
+                sensorData[i].hum = humidity.relative_humidity;
               }
               else
               {
                 // 未接続・エラー時のフォールバック
                 sensorData[i].status = 0;
-                sensorData[i].tmp = "null";
-                sensorData[i].hum = "null";
+                sensorData[i].tmp = NAN;
+                sensorData[i].hum = NAN;
               }
 
               // JSONデータの組み立て (ステータス、AHT21の温度、AHT21の湿度のみ)
