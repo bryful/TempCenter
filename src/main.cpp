@@ -39,6 +39,8 @@ const char *ssid = SECRET_SSID;
 const char *password = SECRET_PASSWORD;
 const int port = 5000;
 WiFiServer server(port);
+WiFiClient activeClient;
+unsigned long activeClientStartTime = 0;
 
 // secrets.h のマクロから IPAddress を生成
 IPAddress local_IP(SECRET_LOCAL_IP);
@@ -54,6 +56,18 @@ Adafruit_AHTX0 aht;
 Adafruit_BMP280 bmp;
 
 TmpHumInfo sensorData[NUM_SENSORS];
+bool ahtInitialized[NUM_SENSORS] = {false};
+
+void clearSensorData()
+{
+  for (uint8_t i = 0; i < NUM_SENSORS; i++)
+  {
+    sensorData[i].status = SENSOR_DISCONNECTED;
+    sensorData[i].tmp = 0;
+    sensorData[i].hum = 0;
+    ahtInitialized[i] = false;
+  }
+}
 
 // TCA9548Aのチャンネル切り替え
 void selectI2CChannel(uint8_t channel)
@@ -103,27 +117,34 @@ void displayHumidityData()
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
 
+  display.println("=== SYSTEM STATUS ===");
+  display.printf("WiFi: %s\n", (WiFi.status() == WL_CONNECTED) ? "CONNECTED" : "DISCONNECTED");
+  display.print("IP: ");
+  display.println(WiFi.localIP().toString());
+
   display.println("=== HUMIDITY ===");
 
   // 6個のセンサーの湿度を表示 (2列表示)
-  for (uint8_t i = 0; i < NUM_SENSORS; i += 2)
+
+  int numRows = (NUM_SENSORS + 1) / 2; // 2列表示のための行数計算
+  for (uint8_t i = 0; i < numRows; i++)
   {
-    display.printf("S%d:", i + 1);
+    display.printf("Ch%d:", i + 1);
     if (sensorData[i].status == SENSOR_OK)
     {
-      display.printf("%.1f%%  ", sensorData[i].hum);
+      display.printf("%.1f%% ", sensorData[i].hum);
     }
     else
     {
-      display.print("N/A  ");
+      display.print("N/A   ");
     }
 
-    if (i + 1 < NUM_SENSORS)
+    if (i + numRows < NUM_SENSORS)
     {
-      display.printf("S%d:", i + 2);
-      if (sensorData[i + 1].status == SENSOR_OK)
+      display.printf("Ch%d:", i + numRows + 1);
+      if (sensorData[i + numRows].status == SENSOR_OK)
       {
-        display.printf("%.1f%%\n", sensorData[i + 1].hum);
+        display.printf("%.1f%%\n", sensorData[i + numRows].hum);
       }
       else
       {
@@ -145,21 +166,55 @@ void readAllSensors()
 
     bool aht_online = checkI2CDeviceConnected(0x38);
 
-    if (aht_online && aht.begin())
-    {
-      sensors_event_t humidity, temp;
-      aht.getEvent(&humidity, &temp);
-
-      sensorData[i].status = SENSOR_OK;
-      sensorData[i].tmp = temp.temperature;
-      sensorData[i].hum = humidity.relative_humidity;
-    }
-    else
+    if (!aht_online)
     {
       sensorData[i].status = SENSOR_DISCONNECTED;
       sensorData[i].tmp = NAN;
       sensorData[i].hum = NAN;
+      ahtInitialized[i] = false;
+      continue;
     }
+
+    if (!ahtInitialized[i])
+    {
+      if (!aht.begin())
+      {
+        sensorData[i].status = SENSOR_DISCONNECTED;
+        sensorData[i].tmp = NAN;
+        sensorData[i].hum = NAN;
+        continue;
+      }
+      ahtInitialized[i] = true;
+      delay(10);
+    }
+
+    sensors_event_t humidity, temp;
+    aht.getEvent(&humidity, &temp);
+
+    // 切替直後の読み取り失敗に備えて1回だけ再試行する
+    if (isnan(temp.temperature) || isnan(humidity.relative_humidity))
+    {
+      delay(10);
+      aht.getEvent(&humidity, &temp);
+      if (isnan(temp.temperature) || isnan(humidity.relative_humidity))
+      {
+        delay(100);
+        aht.getEvent(&humidity, &temp);
+      }
+    }
+
+    if (isnan(temp.temperature) || isnan(humidity.relative_humidity))
+    {
+      sensorData[i].status = SENSOR_DISCONNECTED;
+      sensorData[i].tmp = 0;
+      sensorData[i].hum = 0;
+      ahtInitialized[i] = false;
+      continue;
+    }
+
+    sensorData[i].status = SENSOR_OK;
+    sensorData[i].tmp = temp.temperature;
+    sensorData[i].hum = humidity.relative_humidity;
   }
 }
 
@@ -190,6 +245,7 @@ void setup()
 {
   Serial.begin(115200);
   pinMode(BUTTON_PIN, INPUT_PULLUP);
+  clearSensorData();
 
   // I2C初期化 (SDA:GPIO6, SCL:GPIO7)
   Wire.begin(6, 7);
@@ -223,6 +279,8 @@ void setup()
 
   server.begin();
   Serial.println("\nTCP Server Started.");
+
+  readAllSensors();
 
   // 起動時のセンサー初期化 (未接続 ch があってもフリーズさせない)
   for (uint8_t i = 0; i < NUM_SENSORS; i++)
@@ -264,49 +322,88 @@ void loop()
   }
 
   // 3. TCPサーバー処理 (画面制御へは一切干渉せず、バックグラウンドで処理)
-  WiFiClient client = server.available();
-  if (client)
+  if (!activeClient || !activeClient.connected())
   {
-    String request = "";
-    while (client.connected())
+    activeClient = server.available();
+    if (activeClient)
     {
-      if (client.available())
+      activeClientStartTime = millis();
+      Serial.println("TCP client connected.");
+    }
+  }
+
+  if (activeClient && activeClient.connected())
+  {
+    readAllSensors();
+
+    String request = "";
+    unsigned long startTime = activeClientStartTime;
+    unsigned long lastByteTime = 0;
+    const unsigned long requestTimeoutMs = 2000;
+
+    while (activeClient.connected() && millis() - startTime < requestTimeoutMs)
+    {
+      while (activeClient.available())
       {
-        char c = client.read();
-        request += c;
+        request += (char)activeClient.read();
+        lastByteTime = millis();
+      }
 
-        if (c == '\n')
-        {
-          request.trim();
-
-          if (request == "GET_DATA")
-          {
-            String response = "{\n  \"sensors\": [\n";
-
-            for (uint8_t i = 0; i < NUM_SENSORS; i++)
-            {
-              // JSONデータの組み立て (キャッシュされたセンサーデータを使用)
-              response += String("    {\"ch\":") + i +
-                          ", \"status\":" + (sensorData[i].status == SENSOR_OK ? 1 : 0) +
-                          ", \"aht_temp\":" + sensorData[i].tmp +
-                          ", \"humidity\":" + sensorData[i].hum + "}";
-
-              if (i < NUM_SENSORS - 1)
-                response += ",\n";
-            }
-            response += "\n  ]\n}\n";
-            client.print(response);
-            Serial.println("Sent response to client:\n" + response);
-          }
-          else
-          {
-            client.println("ERROR");
-          }
+      if (request.length() > 0)
+      {
+        if (millis() - lastByteTime > 100)
           break;
-        }
+      }
+      else
+      {
+        delay(5);
       }
     }
-    delay(10);
-    client.stop();
+
+    request.replace("\r", "");
+    request.replace("\n", "");
+    request.trim();
+
+    Serial.println("TCP request: [" + request + "]");
+
+    if (request.length() > 0)
+    {
+      String response = "{\n  \"sensors\": [\n";
+
+      for (uint8_t i = 0; i < NUM_SENSORS; i++)
+      {
+        // JSONデータの組み立て (キャッシュされたセンサーデータを使用)
+        String ahtTempJson = (sensorData[i].status == SENSOR_OK && !isnan(sensorData[i].tmp))
+                                 ? String(sensorData[i].tmp)
+                                 : "null";
+        String humidityJson = (sensorData[i].status == SENSOR_OK && !isnan(sensorData[i].hum))
+                                  ? String(sensorData[i].hum)
+                                  : "null";
+
+        response += String("    {\"ch\":") + i +
+                    ", \"status\":" + (sensorData[i].status == SENSOR_OK ? 1 : 0) +
+                    ", \"aht_temp\":" + ahtTempJson +
+                    ", \"humidity\":" + humidityJson + "}";
+
+        if (i < NUM_SENSORS - 1)
+          response += ",\n";
+      }
+      response += "\n  ]\n}\n";
+      activeClient.print(response);
+      Serial.println("Sent response to client:\n" + response);
+      activeClient.stop();
+      Serial.println("TCP client closed after response.");
+    }
+    else
+    {
+      Serial.println("No command received yet; keeping TCP client open.");
+      activeClient.stop();
+      Serial.println("TCP client closed due to idle timeout.");
+    }
+
+    if (!activeClient.connected())
+    {
+      activeClient = WiFiClient();
+    }
   }
 }
