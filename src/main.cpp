@@ -7,11 +7,16 @@
 #include <Adafruit_SSD1306.h>
 #include "secrets.h" // 機密情報ファイルのインクルード
 
+enum SensorStatus
+{
+  SENSOR_DISCONNECTED = 0,
+  SENSOR_OK = 1
+};
 struct TmpHumInfo
 {
-  int status; // 0: 未接続, 1: 正常
-  float tmp;  // AHT21の温度
-  float hum;  // AHT21の湿度 (※BMP280は湿度非対応のためAHT21から取得)
+  SensorStatus status; // 0: 未接続, 1: 正常
+  float tmp;           // AHT21の温度
+  float hum;           // AHT21の湿度 (※BMP280は湿度非対応のためAHT21から取得)
 };
 
 // --- ピン配置設定 ---
@@ -67,7 +72,7 @@ bool checkI2CDeviceConnected(uint8_t address)
   return (Wire.endTransmission() == 0);
 }
 
-// OLED表示更新用関数
+// OLED表示更新用関数 - システムメッセージ表示
 void updateOLEDDisplay(String msg)
 {
   if (!isDisplayOn)
@@ -85,6 +90,77 @@ void updateOLEDDisplay(String msg)
   display.println("---------------------");
   display.println(msg);
   display.display();
+}
+
+// 湿度表示用関数
+void displayHumidityData()
+{
+  if (!isDisplayOn)
+    return;
+
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  display.println("=== HUMIDITY ===");
+
+  // 6個のセンサーの湿度を表示 (2列表示)
+  for (uint8_t i = 0; i < NUM_SENSORS; i += 2)
+  {
+    display.printf("S%d:", i + 1);
+    if (sensorData[i].status == SENSOR_OK)
+    {
+      display.printf("%.1f%%  ", sensorData[i].hum);
+    }
+    else
+    {
+      display.print("N/A  ");
+    }
+
+    if (i + 1 < NUM_SENSORS)
+    {
+      display.printf("S%d:", i + 2);
+      if (sensorData[i + 1].status == SENSOR_OK)
+      {
+        display.printf("%.1f%%\n", sensorData[i + 1].hum);
+      }
+      else
+      {
+        display.print("N/A\n");
+      }
+    }
+  }
+
+  display.display();
+}
+
+// センサーデータ読み込み関数
+void readAllSensors()
+{
+  for (uint8_t i = 0; i < NUM_SENSORS; i++)
+  {
+    selectI2CChannel(i);
+    delay(5);
+
+    bool aht_online = checkI2CDeviceConnected(0x38);
+
+    if (aht_online && aht.begin())
+    {
+      sensors_event_t humidity, temp;
+      aht.getEvent(&humidity, &temp);
+
+      sensorData[i].status = SENSOR_OK;
+      sensorData[i].tmp = temp.temperature;
+      sensorData[i].hum = humidity.relative_humidity;
+    }
+    else
+    {
+      sensorData[i].status = SENSOR_DISCONNECTED;
+      sensorData[i].tmp = NAN;
+      sensorData[i].hum = NAN;
+    }
+  }
 }
 
 // 画面点灯
@@ -156,7 +232,14 @@ void setup()
     if (checkI2CDeviceConnected(0x38))
       aht.begin();
     if (checkI2CDeviceConnected(0x76))
-      bmp.begin(0x76);
+      if (bmp.begin(0x77))
+      {
+        bmp.setSampling(Adafruit_BMP280::MODE_NORMAL,     /* Operating Mode. */
+                        Adafruit_BMP280::SAMPLING_X2,     /* Temp. oversampling */
+                        Adafruit_BMP280::SAMPLING_X16,    /* Pressure oversampling */
+                        Adafruit_BMP280::FILTER_X16,      /* Filtering. */
+                        Adafruit_BMP280::STANDBY_MS_500); /* Standby time. */
+      }
   }
 
   updateOLEDDisplay("System Ready.\nWaiting for client...");
@@ -164,12 +247,13 @@ void setup()
 
 void loop()
 {
-  // 1. 物理ボタン入力の監視 (画面復帰 / 表示更新)
+  // 1. 物理ボタン入力の監視 (画面復帰・センサー読み込み・表示)
   if (digitalRead(BUTTON_PIN) == LOW)
   {
     Serial.println("Button Triggered!");
     turnOnDisplay();
-    updateOLEDDisplay("Status: Active\nMonitoring sensors...");
+    readAllSensors();
+    displayHumidityData();
     delay(300); // チャタリング防止用ディレイ
   }
 
@@ -201,33 +285,9 @@ void loop()
 
             for (uint8_t i = 0; i < NUM_SENSORS; i++)
             {
-              selectI2CChannel(i);
-              delay(5); // チャンネル切り替えの安定待ちディレイ
-
-              // 接続状態のチェック (必須となるAHT21の生存を主軸に確認)
-              bool aht_online = checkI2CDeviceConnected(0x38);
-
-              if (aht_online && aht.begin())
-              {
-                sensors_event_t humidity, temp;
-                aht.getEvent(&humidity, &temp);
-
-                // 小数点第1位に丸めて構造体と送信用文字列に格納
-                sensorData[i].status = 1;
-                sensorData[i].tmp = temp.temperature;
-                sensorData[i].hum = humidity.relative_humidity;
-              }
-              else
-              {
-                // 未接続・エラー時のフォールバック
-                sensorData[i].status = 0;
-                sensorData[i].tmp = NAN;
-                sensorData[i].hum = NAN;
-              }
-
-              // JSONデータの組み立て (ステータス、AHT21の温度、AHT21の湿度のみ)
+              // JSONデータの組み立て (キャッシュされたセンサーデータを使用)
               response += String("    {\"ch\":") + i +
-                          ", \"status\":" + sensorData[i].status +
+                          ", \"status\":" + (sensorData[i].status == SENSOR_OK ? 1 : 0) +
                           ", \"aht_temp\":" + sensorData[i].tmp +
                           ", \"humidity\":" + sensorData[i].hum + "}";
 
